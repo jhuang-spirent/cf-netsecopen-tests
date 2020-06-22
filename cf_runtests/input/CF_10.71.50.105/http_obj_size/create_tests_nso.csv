@@ -1,0 +1,11 @@
+include,name,type,connection_type,keep_alive,transactions_connection,delay_time,delay_unit,object_type,object_size,delayed_ack,rx_window,icw,ipV4SegmentSize,ipV6SegmentSize,retries,sslTls,tls_version,certificate,ciphers,supportedGroups,signature_hash,tls_record,payloadEncryptionOffload,http_method,post_size,name_suffix,suite
+Y,default_HTTP_Throughput_1k,http_throughput,none,none,none,none,none,none,1000,none,none,none,none,none,none,none,none,none,none,none,none,none,none,none,none,auto,default
+Y,default_HTTP_Throughput_4k,http_throughput,none,none,none,none,none,none,4000,none,none,none,none,none,none,none,none,none,none,none,none,none,none,none,none,auto,default
+Y,default_HTTP_Throughput_16k,http_throughput,none,none,none,none,none,none,16000,none,none,none,none,none,none,none,none,none,none,none,none,none,none,none,none,auto,default
+Y,default_HTTP_Throughput_20k,http_throughput,none,none,none,none,none,none,20000,none,none,none,none,none,none,none,none,none,none,none,none,none,none,none,none,auto,default
+Y,default_HTTP_Throughput_32k,http_throughput,none,none,none,none,none,none,32000,none,none,none,none,none,none,none,none,none,none,none,none,none,none,none,none,auto,default
+Y,default_HTTP_Throughput_64k,http_throughput,none,none,none,none,none,none,64000,none,none,none,none,none,none,none,none,none,none,none,none,none,none,none,none,auto,default
+Y,default_HTTP_Throughput_100k,http_throughput,none,none,none,none,none,none,none,none,none,none,none,none,none,none,none,none,none,none,none,none,none,none,none,auto,default
+Y,default_HTTP_Throughput_128k,http_throughput,none,none,none,none,none,none,128000,none,none,none,none,none,none,none,none,none,none,none,none,none,none,none,none,auto,default
+Y,default_HTTP_Throughput_192k,http_throughput,none,none,none,none,none,none,193000,none,none,none,none,none,none,none,none,none,none,none,none,none,none,none,none,auto,default
+Y,default_HTTP_Throughput_256k,http_throughput,none,none,none,none,none,none,256000,none,none,none,none,none,none,none,none,none,none,none,none,none,none,none,none,auto,default

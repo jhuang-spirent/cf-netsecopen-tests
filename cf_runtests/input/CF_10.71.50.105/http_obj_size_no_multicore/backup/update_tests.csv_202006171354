@@ -1,0 +1,11 @@
+id,name,type,update,update_order,queue,device_id,connection
+792b782811e4e04c7f52ec165248c71f,default_HTTP_Throughput_1k_5yq,http_throughput,Y,1,Kilo,10.71.90.224,p2p
+792b782811e4e04c7f52ec165248ba21,default_HTTP_Throughput_4k_5yq,http_throughput,Y,2,Kilo,10.71.90.224,p2p
+792b782811e4e04c7f52ec165248b31f,default_HTTP_Throughput_16k_5yq,http_throughput,Y,3,Kilo,10.71.90.224,p2p
+792b782811e4e04c7f52ec165248a889,default_HTTP_Throughput_20k_5yq,http_throughput,Y,4,Kilo,10.71.90.224,p2p
+792b782811e4e04c7f52ec165248a33d,default_HTTP_Throughput_32k_5yq,http_throughput,Y,5,Kilo,10.71.90.224,p2p
+792b782811e4e04c7f52ec1652489b5d,default_HTTP_Throughput_64k_5yq,http_throughput,Y,6,Kilo,10.71.90.224,p2p
+792b782811e4e04c7f52ec1652488c51,default_HTTP_Throughput_100k_5yq,http_throughput,Y,7,Kilo,10.71.90.224,p2p
+792b782811e4e04c7f52ec16524887f1,default_HTTP_Throughput_128k_5yq,http_throughput,Y,8,Kilo,10.71.90.224,p2p
+792b782811e4e04c7f52ec1652487e98,default_HTTP_Throughput_192k_5yq,http_throughput,Y,9,Kilo,10.71.90.224,p2p
+792b782811e4e04c7f52ec165248714e,default_HTTP_Throughput_256k_5yq,http_throughput,Y,10,Kilo,10.71.90.224,p2p
