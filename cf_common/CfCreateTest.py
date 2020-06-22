@@ -22,6 +22,7 @@ class BaseTest:
             self.trafficPattern = base["config"]["trafficPattern"]
             self.testType = base["config"]["testType"]
             self.loadSpecification = base["config"]["loadSpecification"]
+            self.runtimeOptions= base["config"]["runtimeOptions"]
         except Exception as e:
             print(f"\nBase test missing data \n{e}")
 
@@ -32,7 +33,7 @@ class CfCreateTest(BaseTest):
         self.name = test_info["name"]
         self.type = test_info["type"]
         self.connection_type = test_info["connection_type"]
-        self.keep_alive = test_info["keep_alive"]
+        self.keep_alive = self.chk_none(test_info["keep_alive"])
         self.transactions = self.chk_none(test_info["transactions_connection"])
         self.delay_time = self.chk_none(test_info["delay_time"])
         self.delay_time_unit = self.chk_none(test_info["delay_unit"])
@@ -56,11 +57,15 @@ class CfCreateTest(BaseTest):
         self.post_size = self.chk_none(test_info["post_size"])
         self.name_suffix = test_info["name_suffix"]
         self.name = self.name + "_" + self.name_suffix
+        self.test_suite = test_info["suite"]
+        self.test_template_config = test_template["config"]
+        self.test_template_runtimeOptions= test_template["config"]["runtimeOptions"]
 
         self.existing_certificate = self.protocol["supplemental"]["sslTls"][
             "certificate"
         ]
-        self.protocol = test_template["config"]["protocol"]
+        if "protocol" in self.test_template_config:
+            self.protocol = test_template["config"]["protocol"]
         self.existing_load_constraints = self.loadSpecification["constraints"]
         self.loadSpecification = test_template["config"]["loadSpecification"]
 
@@ -71,9 +76,19 @@ class CfCreateTest(BaseTest):
         log.info(f"cf_version {self.cf_version}")
 
     def complete_test(self):
-        comp_test = {}
-        comp_test["name"] = self.name
-        comp_test["projectId"] = self.projectId
+      comp_test = {}
+      comp_test["name"] = self.name
+      comp_test["projectId"] = self.projectId
+      if self.test_suite == "default":
+        comp_test["config"] = self.test_template_config
+        comp_test["config"]["queue"] = self.queue
+        comp_test["config"]["debug"] = self.debug
+        comp_test["config"]["subnets"] = self.subnets
+        comp_test["config"]["criteria"] = self.criteria
+        comp_test["config"]["interfaces"] = self.interfaces
+        if self.type not in ["volumetric_ddos", "protocol_ddos"]:
+            comp_test["config"]["virtualRouters"] = self.virtualRouters
+      else:
         comp_test["config"] = {}
         comp_test["config"]["queue"] = self.queue
         comp_test["config"]["debug"] = self.debug
@@ -86,11 +101,38 @@ class CfCreateTest(BaseTest):
         comp_test["config"]["trafficPattern"] = self.trafficPattern
         comp_test["config"]["testType"] = self.testType
         comp_test["config"]["loadSpecification"] = self.loadSpecification
-        return comp_test
+        comp_test["config"]["runtimeOptions"] = self.test_template_runtimeOptions
+
+      return comp_test
 
     def save_test(self, outfile):
         with open(outfile, "w") as f:
             json.dump(self.complete_test(), f, indent=4)
+
+    def update_runtimeOptions(self):
+        try:
+            keys = self.runtimeOptions.keys()
+            for key, value in self.test_template_runtimeOptions.items():
+                if key in keys:
+                    self.test_template_runtimeOptions[key] = self.runtimeOptions[key]
+            if self.test_template_runtimeOptions["statisticsSamplingInterval"] == False:
+                self.test_template_runtimeOptions["statisticsSamplingInterval"] = 4
+        except Exception as e:
+            print(f"\nUnable to set runtime options\n{e}")
+
+    def update_ipv6_interfaces(self):
+        client_subnetIds = []
+        len_subnets = len(self.subnets["client"])
+        len_interfaces = len(self.interfaces["client"])
+        j = 0
+        for i in range(0, len_subnets):
+            client_subnetIds.append(self.subnets["client"][i]["id"])
+        for i in range(0, len_interfaces):
+          for k in range(0, len(self.interfaces["client"][i]["subnetIds"])):
+            if self.interfaces["client"][i]["subnetIds"][k] not in client_subnetIds:
+              self.interfaces["client"][i]["subnetIds"][k] = self.subnets["client"][j]["id"]
+              self.interfaces["server"][i]["subnetIds"][k] = self.subnets["server"][j]["id"]
+              j += 1
 
     def update_network_settings(self):
         try:
@@ -104,6 +146,7 @@ class CfCreateTest(BaseTest):
             self.networks["server"]["initialCongestionWindow"] = int(
                 self.initial_congestion_window
             )
+
             self.networks["server"]["receiveWindow"] = int(self.rx_window)
             self.networks["server"]["delayedAcks"]["bytes"] = int(self.delayed_ack)
             self.networks["server"]["retries"] = int(self.retries)
@@ -148,7 +191,8 @@ class CfCreateTest(BaseTest):
             connection_type = "keepAlive"
         elif connection_type.lower() in {"separateconnections", "separate"}:
             connection_type = "separateConnections"
-
+        else:
+            return False
         try:
             self.protocol["connection"]["type"] = connection_type
         except Exception as e:
@@ -398,12 +442,17 @@ class CfCreateTest(BaseTest):
             return value
 
     def update_config_changes(self):
-        self.update_network_settings()
-        self.update_criteria_settings()
-        # self.update_load_constraints()
-        self.update_close_with_fin()
-        if 19300000 < self.cf_version:
-            self.update_http_method(self.http_method, self.post_size)
+        if "ipv6" in self.name.lower():
+            self.update_ipv6_interfaces()
+        if self.test_suite != "default":
+            self.update_close_with_fin()
+            self.update_criteria_settings()
+            # self.update_load_constraints()
+            if 19300000 < self.cf_version:
+                self.update_http_method(self.http_method, self.post_size)
+        self.update_runtimeOptions()
+        if None not in [self.initial_congestion_window, self.rx_window, self.delayed_ack, self.retries, self.ipV4SegmentSize, self.ipV6SegmentSize]:
+            self.update_network_settings()
         if self.object_size is not None:
             self.update_object_size(self.object_type, self.object_size)
         if self.keep_alive is not None:
@@ -440,6 +489,7 @@ class TestsToRun:
             f.write(self.test_header_csv_line(self.reference_tests))
 
     def add_test(self, new_test_dict, test_type):
+        print(new_test_dict)
         test_ref_match = False
         for test in self.reference_tests:
             if new_test_dict["name"].startswith(test["name"]):
@@ -447,7 +497,7 @@ class TestsToRun:
                     test, new_test_dict, test_type
                 )
                 test_ref_match = True
-                print(f"{test['name']}\n{test_csv_info}")
+                #print(f"{test['name']}\n{test_csv_info}")
                 with open(self.test_to_run_csv_file, "a") as f:
                     f.write(test_csv_info)
         if not test_ref_match:
@@ -474,4 +524,29 @@ class TestsToRun:
             if key not in {"name", "id", "type"}:
                 csv_line = csv_line + value + ","
         csv_line = csv_line[:-1] + "\n"  # remove last comma and add end line
+        return csv_line
+
+
+class TestsToUpdate:
+    def __init__(self, test_to_update_csv_file):
+        self.test_to_update_csv_file = test_to_update_csv_file
+        # write headers to tests to run csv file
+        with open(self.test_to_update_csv_file, "w") as f:
+            f.write(self.test_header_csv_line())
+
+    def add_test(self, new_test_dict, test_type, update, update_order, queue, device_id, connection):
+        test_csv_info = self.test_csv_line_values(
+            new_test_dict, test_type, update, update_order, queue, device_id, connection
+                )
+        with open(self.test_to_update_csv_file, "a") as f:
+            f.write(test_csv_info)
+
+    @staticmethod
+    def test_header_csv_line():
+        csv_line = f"id,name,type,update,update_order,queue,device_id,connection"
+        return csv_line
+
+    @staticmethod
+    def test_csv_line_values(new_test_dict, test_type, update, update_order, queue, device_id, connection):
+        csv_line = f"\n{new_test_dict['id']},{new_test_dict['name']},{test_type},{update},{update_order},{queue},{device_id},{connection}"
         return csv_line

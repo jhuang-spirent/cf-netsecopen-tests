@@ -1,5 +1,95 @@
 import pathlib
+import sys
+import importlib
+import os
+import csv
+from datetime import datetime
+from shutil import copyfile
 
+
+def add_sys_path(dirName):
+    if type(dirName) == str:
+        dirName = pathlib.Path(dirName)
+    if dirName.is_dir():
+        sys.path.append(str(dirName))
+    else:
+        print(f"{dirName} does not exist")
+        return False
+    return True
+
+
+def loadModule(moduleName):
+    module = None
+    try:
+        del sys.modules[moduleName]
+    except BaseException as err:
+        pass
+    try:
+        module = importlib.import_module(moduleName)
+    except BaseException as err:
+        serr = str(err)
+        print("Error to load the module '" + moduleName + "': " + serr)
+    return module
+ 
+def rm_file(filename):
+    filename = str(filename)
+    if os.path.isfile(filename):
+        os.remove(filename)
+    else:    ## Show an error ##
+        print(f"Error: {filename} not found")
+
+def backup_file(filename):
+    filename = str(filename)
+    if os.path.isfile(filename):
+        path = filename.rsplit(os.sep,1)[0]
+        name = filename.rsplit(os.sep,1)[1]
+        backup_file = name + "_" + datetime.fromtimestamp(os.path.getctime(filename)).strftime("%Y%m%d%H%M")
+        backup_path = path + os.sep + "backup"
+        if not os.path.isdir(backup_path):
+            os.mkdir(backup_path)
+        full_backup_file = backup_path + os.sep + backup_file
+        copyfile(filename, full_backup_file)
+        #print(f"backing up {name} to {backup_file}")
+    else:    ## Show an error ##
+        print(f"Error: {filename} not found")
+
+def delete_test(test_id_list, filename):
+    new_list = []
+    with open(filename, "r") as f:
+        reader = csv.DictReader(f)
+        test_list = list(reader)
+    if test_list:
+        for test in test_list:
+            if test['id'] not in test_id_list:
+                new_list.append(test)    
+    with open(filename, 'w') as f:
+        if test_list:
+            writer = csv.DictWriter(f, test_list[0].keys())
+            writer.writeheader()
+            if new_list:
+                for test in new_list: 
+                    writer.writerow(test)
+    f.close()
+
+def get_testid_in_project(project):
+    test_id_list = []
+    for test in project["tests"]:
+        test_id_list.append(test["id"])
+    return test_id_list
+    
+def match_nso_test(test_id_list, filename):
+    found = False
+    test_list = []
+    if filename.is_file():
+        with open(filename, "r") as f:
+            reader = csv.DictReader(f)
+            test_list = list(reader)
+    if test_list and test_id_list:
+        for test in test_list:
+            if test['id'] in test_id_list:
+                found = True
+                break
+    return found  
 
 def verify_directory_structure(bool_project_dir, input_dir, output_dir, report_dir):
     # parent.parent assumes this function is in a sub directory of the main project
@@ -26,8 +116,11 @@ def verify_directory_structure(bool_project_dir, input_dir, output_dir, report_d
 
 
 def html_report(df_table, sub_report_tables, html_report_file, filter_columns,
-                script_version):
+                script_version, report_header=""):
     html = ""
+    report_header_html = f"<h2 style='color:Tomato;'>{report_header}</h2>"
+    html = html + report_header_html
+
     for sub_table in sub_report_tables:
         df_table.reset_df_filter()
         df_table.filter_rows_containing(sub_table)

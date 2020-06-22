@@ -1,3 +1,4 @@
+#!/usr/bin/python3
 import json
 import logging
 import time
@@ -8,6 +9,7 @@ import pandas as pd
 import pathlib
 import sys
 import math
+from shutil import move
 
 script_version = 1.79
 
@@ -36,12 +38,14 @@ class RollingStats:
         self.avg_val_last = 0
         self.increase_avg = 0
         self.variance = 0.000
-        self.avg_max_load_variance = 0.00
+        self.avg_max_variance = 0.00
         self.new_high = False
         self.highest_value = 0
         self.not_high_count = 0
         self.stable = False
         self.stable_count = 0
+        self.unstable_count = 0
+        self.no_positive_increase_count = 0
 
     def update(self, new_value):
         """Updates Rolling List and returns current variance
@@ -74,6 +78,11 @@ class RollingStats:
         """
         self.list = [0] * self.sample_size
 
+    def reset_count(self):
+        #print(f"reset unstable_count and no_positive_increase_count back to all 0")
+        self.unstable_count = 0
+        self.no_positive_increase_count = 0
+
     def check_if_stable(self, max_var_reference):
         """Checks if load is stable in current list
 
@@ -82,14 +91,15 @@ class RollingStats:
         :param max_var_reference: user/test configured reference value, e.g. 0.03 for 3%
         :return: True if stable, False if not
         """
+        self.increase_since_last_load_change()
         if self.variance <= max_var_reference:
             self.stable = True
             self.stable_count += 1
-            self.increase_since_last_load_change()
             return True
         else:
             self.stable = False
             self.stable_count = 0
+            self.unstable_count += 1
             return False
 
     def increase_since_last_load_change(self):
@@ -105,6 +115,8 @@ class RollingStats:
                 (self.avg_val - self.avg_val_last) / self.avg_val_last
             ) * 100
             self.increase_avg = round(self.increase_avg, 2)
+            if self.increase_avg <= 0:
+                self.no_positive_increase_count += 1
         else:
             self.avg_val_last = 1
 
@@ -132,10 +144,10 @@ class RollingStats:
             self.new_high = False
             self.not_high_count += 1
 
-        self.avg_max_load_variance = (
+        self.avg_max_variance = (
             (self.avg_val / self.highest_value) if self.highest_value != 0 else 0
         )
-        self.avg_max_load_variance = round(self.avg_max_load_variance, 2)
+        self.avg_max_variance = round(self.avg_max_variance, 2)
 
         if self.new_high:
             return True
@@ -203,21 +215,50 @@ class CfRunTest:
             self.in_goal_seek = False
 
         self.test_config = self.get_test_config()
+        self.test_suite = test_details["suite"]
+        self.goal_seek_count = 0
+        self.goal_seek_count_after_max_load = 0
+        self.c_current_load_startup = 0
+        self.c_memory_main_used_startup = 0
+        self.s_memory_main_used_startup = 0
+        self.c_memory_one_connection = 0
+        self.ttfb_threshold = int(100)
+        self.pkt_memory_threshold = int(2500)
+        self.speed_capacity_adjust = 1.2
+        self.count_load_adjust_low = 1.2
+        self.count_load_adjust_high = 1.5
+        self.count_load_adjust_emix = 1.5
+        self.new_load_list = []
+        self.load_increase_list = []
+        self.highest_pair = {"highest_tps": 0, "highest_load": 0, "highest_desired_load": 0, "highest_bw": 0, "highest_cps": 0, "highest_conns": 0}
         self.queue_id = self.test_config["config"]["queue"]["id"]
-        self.queue_info = self.get_queue(self.queue_id)
-        self.queue_capacity = int(self.queue_info["capacity"])
+        self.get_queue_keyinfo()
+        (report_dir, report_name) = self.get_report_info()
+        self.result_file.make_report_dir(report_dir)
+        self.result_file.make_report_csv_file(report_name)
+        self.get_response_length()
+        self.client_ports = []
+        self.server_ports = []
+        self.subnet_number = len(self.test_config["config"]["interfaces"]["client"])
+        for i in range(0, self.subnet_number):
+            self.client_ports.append(self.test_config["config"]["interfaces"]["client"][i]["portSystemId"])
+            self.server_ports.append(self.test_config["config"]["interfaces"]["server"][i]["portSystemId"])
+        print(f"Client ports: {self.client_ports}")
+        print(f"Server ports: {self.server_ports}")
+        #self.queue_info = self.get_queue(self.queue_id)
+        #self.queue_capacity = int(self.queue_info["capacity"])
         log.info(f"queue_capacity: {self.queue_capacity}")
-        self.core_count = self.core_count_lookup(self.queue_info)
-        log.info(f"core_count: {self.core_count}")
+        #self.core_count = self.core_count_lookup(self.queue_info)
+        #log.info(f"core_count: {self.core_count}")
         self.client_port_count = len(self.test_config["config"]["interfaces"]["client"])
         log.info(f"client_port_count: {self.client_port_count}")
         self.server_port_count = len(self.test_config["config"]["interfaces"]["server"])
         log.info(f"server_port_count: {self.server_port_count}")
-        self.client_core_count = int(
-            self.core_count
-            / (self.client_port_count + self.server_port_count)
-            * self.client_port_count
-        )
+        #self.client_core_count = int(
+        #    self.core_count
+        #    / (self.client_port_count + self.server_port_count)
+        #    * self.client_port_count
+        #)
         log.info(f"client_core_count: {self.client_core_count}")
         self.in_capacity_adjust = self.check_capacity_adjust(
             test_details["capacity_adj"],
@@ -225,12 +266,13 @@ class CfRunTest:
             self.client_port_count,
             self.client_core_count,
         )
-        log.info(f"in_capacity_adjust: {self.in_capacity_adjust}")
         self.load_constraints = {"enabled": False}
         if not self.update_config_load():
             report_error = f"unknown load_type with test type"
             log.debug(report_error)
             print(report_error)
+        print(f"in_capacity_adjust: {self.in_capacity_adjust}")
+        log.info(f"in_capacity_adjust: {self.in_capacity_adjust}")
         self.test_config = self.get_test_config()
 
         self.test_run = self.start_test_run()
@@ -344,7 +386,7 @@ class CfRunTest:
         self.max_var_reference = self.in_max_variance
         self.rolling_tps = RollingStats(self.rolling_sample_size, 0)
         self.rolling_ttfb = RollingStats(self.rolling_sample_size, 1)
-        self.rolling_current_load = RollingStats(self.rolling_sample_size, 0)
+        self.rolling_load = RollingStats(self.rolling_sample_size, 0)
         self.rolling_count_since_goal_seek = RollingStats(
             self.rolling_sample_size, 1
         )  # round to 1 for > 0 avg
@@ -418,6 +460,56 @@ class CfRunTest:
             )
         return response
 
+    def get_queue_keyinfo(self):
+        self.queue_speed = int(0)
+        self.client_core_count = int(0)
+        self.queue_capacity = int(0)
+        self.portSystemId = []
+        self.queue_id = self.test_config["config"]["queue"]["id"]
+        self.subnet_number = len(self.test_config["config"]["interfaces"]["client"])
+        for i in range(0, self.subnet_number):
+            self.portSystemId.append(self.test_config["config"]["interfaces"]["client"][i]["portSystemId"])
+        self.device_id = self.portSystemId[0].split("/", 1)[0]
+        self.device_info = self.cf.get_device_info(self.device_id, self.temp_dir / "device_info.json")
+        for computeGroup in self.device_info["slots"][0]["computeGroups"]:
+            for port in computeGroup["ports"]:
+                if port["systemId"] in self.portSystemId:
+                    self.queue_speed = self.queue_speed + int(port["speed"])
+                    self.client_core_count = self.client_core_count + int(port["cores"])
+                    self.queue_capacity = self.queue_capacity + int(port["capacity"])
+        print(f"Client speed: {self.queue_speed/1000}G")
+        print(f"Client cores: {self.client_core_count}")
+        
+    def get_report_info(self):
+        self.device_mode = ""
+        self.device_ip = self.device_info["ip"]
+        self.device_description = self.device_info["description"][4:]
+        self.device_firmware = self.device_info["firmware"]["version"]
+        self.device_profile = self.device_info["slots"][0]["profile"]
+        for profile_info in ["Functional-", "Performance-", "Maximum-"]:
+            if profile_info in self.device_profile:
+                self.device_profile = self.device_profile.split(profile_info)[-1].strip("\n")
+                break
+        if self.device_description == "CFV":
+            self.device_model = self.device_info["slots"][0]["model"][8:-5]
+            report_dir_info = (self.device_description, self.device_model)
+        else:
+            report_dir_info = (self.device_description, self.device_profile)
+        report_name_info = (self.device_ip, self.device_firmware)
+        report_dir = "-".join(report_dir_info)
+        report_name = "_".join(report_name_info)
+        return (report_dir, report_name)
+
+    def get_response_length(self):
+        self.response_length = 987654321
+        if "protocol" in self.test_config["config"]:
+            if "responseBodyType" in self.test_config["config"]["protocol"]:
+                self.response_config = self.test_config["config"]["protocol"]["responseBodyType"]["config"]
+                if "length" in self.response_config:
+                    self.response_length = self.response_config["length"]
+                if "bytes" in self.response_config:
+                    self.response_length = self.response_config["bytes"]
+
     @staticmethod
     def core_count_lookup(queue_info):
         cores = 0
@@ -441,50 +533,83 @@ class CfRunTest:
         load_type = self.in_load_type.lower()
         test_type = self.test_type()
 
+        self.minimal_load_spec_change = 1
         if test_type in {"tput", "emix"} and load_type == "simusers":
-            load_key = "bandwidth"
+            self.load_key = "bandwidth"
             self.in_load_type = "SimUsers"
         elif test_type in {"tput", "emix"} and load_type == "bandwidth":
-            load_key = "bandwidth"
+            self.load_key = "bandwidth"
             self.in_load_type = "Bandwidth"
-        elif test_type == "tput" and load_type == "simusers/second":
-            load_key = "bandwidth"
+            self.minimal_load_spec_change = 5000
+        elif test_type in {"tput", "emix"} and load_type == "simusers/second":
+            self.load_key = "bandwidth"
             self.in_load_type = "SimUsers/Second"
+            if self.response_length <= 1000:
+                self.minimal_load_spec_change = 8
         elif test_type == "cps" and load_type == "connections/second":
-            load_key = "connectionsPerSecond"
+            self.load_key = "connectionsPerSecond"
             self.in_load_type = "Connections/Second"
+            self.minimal_load_spec_change = 100
         elif test_type == "cps" and load_type == "simusers":
-            load_key = "connectionsPerSecond"
+            self.load_key = "connectionsPerSecond"
             self.in_load_type = "SimUsers"
         elif test_type == "cps" and load_type == "simusers/second":
-            load_key = "connectionsPerSecond"
+            self.load_key = "connectionsPerSecond"
             self.in_load_type = "SimUsers/Second"
+            self.minimal_load_spec_change = 200
         elif test_type == "conns" and load_type == "simusers":
-            load_key = "connections"
+            self.load_key = "connections"
             self.in_load_type = "SimUsers"
+            self.minimal_load_spec_change = 100
         elif test_type == "conns" and load_type == "connections":
-            load_key = "connections"
+            self.load_key = "connections"
             self.in_load_type = "Connections"
+            self.minimal_load_spec_change = 500
+        elif self.test_type == "conns" and load_type == "simusers/second":
+            self.load_key = "connections"
+            self.in_load_type = "SimUsers/Second"
+            self.minimal_load_spec_change = 10
+        elif self.test_type == "max_cps":
+            self.load_key = "connectionsPerSecond"
+        elif self.test_type == "max_tput":
+            self.load_key = "bidirectionalBandwidth"
+        elif self.test_type == "ddos":
+            self.load_key = "bandwidth"
+            self.in_start_load = int(self.queue_speed * 1000)
         else:
             return False
 
-        self.in_start_load = int(self.in_start_load) * self.in_capacity_adjust
-        self.update_load_constraints()
+        if self.test_suite == "default":
+          if self.test_type in ["ddos", "max_cps", "max_tput"]:
+            self.in_load_type = ""
+            self.in_goal_seek = False
+            self.in_duration = 300
+            self.in_rampup = 120
+            self.in_rampdown = 0 
+            self.in_shutdown = 32 
+          else:
+            if self.response_length <= 4000:
+                self.in_capacity_adjust = self.round_up_to_core(16, self.client_core_count)
+            elif self.response_length <= 16000:
+                self.in_capacity_adjust = self.round_up_to_core(8, self.client_core_count)
+            elif self.response_length <= 32000:
+                self.in_capacity_adjust = self.round_up_to_core(4, self.client_core_count)
+            else:
+                self.in_capacity_adjust = self.round_up_to_core(3, self.client_core_count)
+            self.in_start_load = int(self.in_start_load) * self.client_core_count
+            if self.in_start_load <= 16:
+                self.in_start_load = self.round_up_to_core(16, self.client_core_count) 
+        else:
+            self.in_start_load = int(self.in_start_load) * self.in_capacity_adjust
+            self.update_load_constraints()
+        self.update_load_specification()
+        self.update_runtime_options()
         load_update = {
             "config": {
-                "loadSpecification": {
-                    "duration": int(self.in_duration),
-                    "startup": int(self.in_startup),
-                    "rampup": int(self.in_rampup),
-                    "rampdown": int(self.in_rampdown),
-                    "shutdown": int(self.in_shutdown),
-                    load_key: int(self.in_start_load),
-                    "type": self.in_load_type,
-                    "constraints": self.load_constraints,
-                    # "constraints": {"enabled": False},
+                "runtimeOptions": self.runtime_options,
+                "loadSpecification": self.load_specification,
                 }
-            }
-        }
+              }
         with open(self.temp_dir / "test_load_update.json", "w") as f:
             json.dump(load_update, f, indent=4)
 
@@ -517,6 +642,46 @@ class CfRunTest:
                 "connectionsRate": connections_rate,
             }
 
+    def update_load_specification(self):
+        if self.test_type == "ddos":
+            self.load_specification = {
+                "duration": int(self.in_duration),
+                "startup": int(self.in_startup),
+                "rampup": int(self.in_rampup),
+                "shutdown": int(self.in_shutdown),
+                self.load_key: int(self.in_start_load),
+            }
+        elif self.test_type in ["max_cps", "max_tput"]:
+            self.load_specification = {
+                "duration": int(self.in_duration),
+                "startup": int(self.in_startup),
+                "rampup": int(self.in_rampup),
+                "shutdown": int(self.in_shutdown),
+            }
+        else:
+            self.load_specification = {
+                "duration": int(self.in_duration),
+                "startup": int(self.in_startup),
+                "rampup": int(self.in_rampup),
+                "rampdown": int(self.in_rampdown),
+                "shutdown": int(self.in_shutdown),
+                self.load_key: int(self.in_start_load),
+                "type": self.in_load_type,
+                "constraints": self.load_constraints,
+                #"constraints": {"enabled": False},
+            }
+
+    def update_runtime_options(self):
+        self.stat_sampling_interval = self.test_config["config"]["runtimeOptions"]["statisticsSamplingInterval"]
+        if self.stat_sampling_interval == False:
+            if int(self.in_duration) <= 800:
+                self.stat_sampling_interval = 4
+            else:
+                self.stat_sampling_interval = int(self.in_duration/200)
+        self.runtime_options = {
+            "statisticsSamplingInterval": self.stat_sampling_interval,
+            }
+
     def test_type(self):
         if self.type_v2 == "http_throughput":
             test_type = "tput"
@@ -526,8 +691,15 @@ class CfRunTest:
             test_type = "conns"
         elif self.type_v2 == "emix":
             test_type = "emix"
+        elif self.type_v2 == "max_http_connections_per_second":
+            test_type = "max_cps"
+        elif self.type_v2 == "max_http_throughput":
+            test_type = "max_tput"
+        elif self.type_v2 in ["volumetric_ddos", "protocol_ddos"]:
+            test_type = "ddos"
         else:
             test_type = "tput"
+        self.test_type = test_type
         return test_type
 
     def start_test_run(self):
@@ -594,11 +766,11 @@ class CfRunTest:
             phase = "rampdown"
         elif (
             (self.in_duration - self.in_shutdown)
-            <= self.time_elapsed
-            <= self.in_duration
+            <= self.time_elapsed + self.stat_sampling_interval
+            < self.in_duration
         ):
             phase = "shutdown"
-        elif self.in_duration <= self.time_elapsed:
+        elif self.in_duration <= self.time_elapsed + self.stat_sampling_interval:
             phase = "finished"
 
         log.info(f"test phase: {phase}")
@@ -615,7 +787,9 @@ class CfRunTest:
 
     def update_run_stats(self):
         get_run_stats = self.cf.fetch_test_run_statistics(self.id)
-        # log.debug(f'{get_run_stats}')
+        #log.debug(f'********************************************')
+        #log.debug(f'{get_run_stats}')
+        #log.debug(f'********************************************')
         self.update_client_stats(get_run_stats)
         self.update_server_stats(get_run_stats)
 
@@ -735,10 +909,17 @@ class CfRunTest:
         self.time_elapsed = client_stats.get("timeElapsed", 0)
         self.time_remaining = client_stats.get("timeRemaining", 0)
 
+        if self.test_type in ["max_cps", "max_tput"]:
+            self.c_rx_bandwidth = client_stats.get("sum", {}).get("rxBandwidth", 0)
+            self.c_tx_bandwidth = client_stats.get("sum", {}).get("txBandwidth", 0)
+            self.c_http_aborted_txns = client_stats.get("sum", {}).get("abortedTxns", 0)
+            self.c_current_load = client_stats.get("esp", {}).get("currentLoadSpecCount", 0)
+            self.c_desired_load = client_stats.get("esp", {}).get("desiredLoadSpecCount", 0)
+
         self.c_total_bandwidth = self.c_rx_bandwidth + self.c_tx_bandwidth
         if self.c_memory_main_size > 0 and self.c_memory_main_used > 0:
-            self.c_memory_percent_used = round(
-                self.c_memory_main_used / self.c_memory_main_size, 1
+            self.c_memory_percent_used = round(100*
+                (self.c_memory_main_used / self.c_memory_main_size), 2
             )
         if self.c_current_load > 0 and self.c_desired_load > 0:
             self.c_current_desired_load_variance = round(
@@ -749,6 +930,14 @@ class CfRunTest:
             self.c_transaction_error_percentage = (
                 self.c_http_unsuccessful_txns + self.c_http_aborted_txns
             ) / self.c_http_successful_txns
+        self.c_cpu_percent = round(100 - self.c_loadspec_avg_cpu, 2)
+        self.c_memory_percent = round(100 - self.c_memory_percent_used, 2)
+        self.c_pktmem_percent = round(100 - (self.c_memory_packetmem_used*100)/self.pkt_memory_threshold, 2)
+        self.c_ttfb_percent = round(100 - (self.c_tcp_avg_ttfb*100)/self.ttfb_threshold, 2)
+        if self.c_current_load_startup == 0:
+            self.c_current_load_startup = self.c_current_load
+        if self.c_memory_main_used_startup == 0:
+            self.c_memory_main_used_startup = self.c_memory_main_used
         return True
 
     def assign_server_run_stats(self, server_stats):
@@ -773,11 +962,163 @@ class CfRunTest:
         self.s_tcp_closed = server_stats.get("sum", {}).get("closedWithNoError", 0)
         self.s_tcp_closed_reset = server_stats.get("sum", {}).get("closedWithReset", 0)
 
+        if self.test_type in ["max_cps", "max_tput", "ddos"]:
+            self.c_tcp_established_conn_rate = server_stats.get("sum", {}).get("connsPerSec", 0)
+        if self.test_type in ["ddos"]:
+            self.c_tcp_established_conns = server_stats.get("sum", {}).get("openConns", 0)
+
         if self.s_memory_main_size > 0 and self.s_memory_main_used > 0:
-            self.s_memory_percent_used = round(
-                self.s_memory_main_used / self.s_memory_main_size, 1
+            self.s_memory_percent_used = round(100*
+                (self.s_memory_main_used / self.s_memory_main_size), 2
             )
+        self.s_cpu_percent = round(100 - self.s_memory_avg_cpu, 2)
+        self.s_memory_percent = round(100 - self.s_memory_percent_used, 2)
+        self.s_pktmem_percent = round(100 - (self.s_memory_packetmem_used*100)/self.pkt_memory_threshold, 2)
+        if self.s_memory_main_used_startup == 0:
+            self.s_memory_main_used_startup = self.s_memory_main_used
         return True
+
+    def check_resource(self):
+        log.debug("Inside the check_resources method.")
+        current_available = {}
+        if self.test_type == "conns" and self.in_load_type != "SimUsers/Second":
+            current_available['Client Memory'] = self.c_memory_percent
+            current_available['Server Memory'] = self.s_memory_percent
+            self.lowest_available_resource = min(current_available.values())
+        else:
+            current_available['Client CPU'] = self.c_cpu_percent
+            current_available['Server CPU'] = self.s_cpu_percent
+            current_available['Client Pkt Mem'] = self.c_pktmem_percent
+            current_available['Server Pkt Mem'] = self.s_pktmem_percent
+            current_available['TTFB'] = self.c_ttfb_percent
+            current_available['BW'] = round(100 * (self.queue_speed * self.speed_capacity_adjust - self.c_total_bandwidth/1000)/self.queue_speed, 2)
+            if self.goal_seek_count >= 2:
+                current_available['Client Memory'] = self.c_memory_percent
+                current_available['Server Memory'] = self.s_memory_percent
+            self.lowest_available_resource = min(current_available.values())
+        for key, val in current_available.items():
+            if val == self.lowest_available_resource:
+                lowest = key
+        log.debug(f"Lowest available resource is {lowest} at {self.lowest_available_resource}% availability")
+        if self.lowest_available_resource < 0:
+            log.warning(f"Resource spike detected: {lowest} is {self.lowest_available_resource}% available ")
+        elif self.lowest_available_resource < 1:
+            log.warning(f"At least one resource is exhausted or close to exhausted: "
+                        f"{lowest} is {self.lowest_available_resource}% available")
+            log.debug((f"At least one resource is exhausted or close to exhausted. Current percentages are: "
+                        f"\nClient CPU {self.c_cpu_percent}% available "
+                        f"\nServer CPU {self.s_cpu_percent}% available "
+                        f"\nClient Memory {self.c_memory_percent}% available "
+                        f"\nServer Memory {self.s_memory_percent}% available "
+                        f"\nClient Packet Memory {self.c_pktmem_percent}% available "
+                        f"\nServer Packet Memory {self.s_pktmem_percent}% available "
+                        f"\nTTFB {self.c_ttfb_percent}% available (% of specified acceptable limit)"))
+
+    def count_new_load(self):
+        log.debug("Counting new load")
+        counted_load = 0
+        self.check_resource()
+        check_minimal_load = True
+        load_increase_value = int(round(self.minimal_load_spec_change * self.in_capacity_adjust) )
+        last_loadspec_increase_percentage = self.rolling_load.increase_avg
+        last_metric_increase_percentage = max(self.rolling_tps.increase_avg,
+                                              self.rolling_cps.increase_avg,
+                                              self.rolling_bw.increase_avg)
+        metric_evolution_based_percentage_increase = int(round(last_metric_increase_percentage / 2))
+        if metric_evolution_based_percentage_increase <= 0:
+            metric_evolution_based_percentage_increase = 0.3
+        if self.lowest_available_resource != 100:
+            tentative_load_increase_percentage = (self.lowest_available_resource / (100 - self.lowest_available_resource))*100
+        else:
+            tentative_load_increase_percentage = 100
+        loadValueIncreasePercentage = int(round(tentative_load_increase_percentage / 2))
+        if loadValueIncreasePercentage <= 0:
+            loadValueIncreasePercentage = 0.3
+        if loadValueIncreasePercentage >=200:
+            loadValueIncreasePercentage = loadValueIncreasePercentage / 1.2
+        resource_based_percentage_increase = loadValueIncreasePercentage
+        log.debug(f"last_loadspec_increase_percentage is: {last_loadspec_increase_percentage}")
+        log.debug(f"last_metric_increase_percentage is: {last_metric_increase_percentage}")
+        log.debug(f"self.lowest_available_resource is: {self.lowest_available_resource}")
+        log.debug(f"metric_evolution_based_percentage_increase is: {metric_evolution_based_percentage_increase}")
+        log.debug(f"resource_based_percentage_increase is: {resource_based_percentage_increase}")
+        if self.test_type == "conns" and self.in_load_type != "SimUsers":
+            log.debug(f"Open Conns")
+            if self.in_load_type == "SimUsers/Second":
+                if self.lowest_available_resource < 30:
+                    load_increase_value = int(round(self.c_current_load * resource_based_percentage_increase / 2) / 100)
+                else:
+                    load_increase_value = int(round(self.c_current_load * resource_based_percentage_increase ) / 100)
+            if self.in_load_type == "Connections":
+                if self.c_memory_one_connection == 0:
+                    self.c_memory_one_connection = round((self.c_memory_main_used - self.c_memory_main_used_startup) * 1000 / (self.c_current_load - self.c_current_load_startup), 2)
+                load_increase_value = int((self.c_memory_main_size - self.c_memory_main_used_startup) * 1000 / self.c_memory_one_connection) - self.c_current_load
+                log.debug(f"Memory of Client for one Connection: {self.c_memory_one_connection}K")
+        elif self.test_type == "cps":
+            if self.rolling_tps.increase_avg >= 10:
+                load_increase_value = int(round(self.minimal_load_spec_change * self.in_capacity_adjust) * 5 )
+            elif self.rolling_tps.increase_avg >= 4:
+                load_increase_value = int(round(self.minimal_load_spec_change * self.in_capacity_adjust) * 4 )
+            elif self.rolling_tps.increase_avg >= 2:
+                load_increase_value = int(round(self.minimal_load_spec_change * self.in_capacity_adjust) * 3 )
+            elif self.rolling_tps.increase_avg >= 0.5:
+                load_increase_value = int(round(self.minimal_load_spec_change * self.in_capacity_adjust) * 2 )
+            else:
+                load_increase_value = int(round(self.minimal_load_spec_change * self.in_capacity_adjust) )
+            if self.max_load_reached:
+                load_increase_value = int(round(self.minimal_load_spec_change * self.in_capacity_adjust / 2) )
+                check_minimal_load = False
+        else:
+            if last_loadspec_increase_percentage <= 0.3 or last_metric_increase_percentage <= 0.3:
+                log.debug(f"Case 1: last_loadspec_increase_percent {last_loadspec_increase_percentage}, last_metric_increase_percent is {last_metric_increase_percentage}")
+                if self.lowest_available_resource <=1:
+                    load_increase_value = int(round(self.c_current_load * resource_based_percentage_increase) / 100)
+                else:
+                    load_increase_value = int(round(self.c_current_load * resource_based_percentage_increase / self.count_load_adjust_high) / 100)
+            else:
+                log.debug(f"Case 2: last_metric_increase_percent {last_metric_increase_percentage}, last_loadspec_increase_percent {last_loadspec_increase_percentage}")
+                if metric_evolution_based_percentage_increase > resource_based_percentage_increase:
+                    if resource_based_percentage_increase >= 30:
+                        load_increase_value = int(round(self.c_current_load * resource_based_percentage_increase ) / 100)
+                    elif resource_based_percentage_increase >= 5:
+                        load_increase_value = int(round(self.c_current_load * resource_based_percentage_increase / self.count_load_adjust_high) / 100)   
+                    else:
+                        load_increase_value = int(round(self.c_current_load * resource_based_percentage_increase / self.count_load_adjust_low) / 100)  
+                else:
+                    if resource_based_percentage_increase >= 100:
+                        load_increase_value = int(round(self.c_current_load * resource_based_percentage_increase * self.count_load_adjust_low) / 100)
+                    elif resource_based_percentage_increase >= 50 and resource_based_percentage_increase < 100:
+                        load_increase_value = int(round(self.c_current_load * resource_based_percentage_increase / self.count_load_adjust_high) / 100)
+                    elif resource_based_percentage_increase >= 35:
+                        load_increase_value = int(round(self.c_current_load * resource_based_percentage_increase / self.count_load_adjust_low) / 100)
+                    elif resource_based_percentage_increase >= 20:
+                        load_increase_value = int(round(self.c_current_load * resource_based_percentage_increase) / 100)
+                    elif resource_based_percentage_increase >= 10:
+                        load_increase_value = int(round(self.c_current_load * resource_based_percentage_increase / self.count_load_adjust_low) / 100)
+                    elif resource_based_percentage_increase >= 1:
+                        load_increase_value = int(round(self.c_current_load * resource_based_percentage_increase / self.count_load_adjust_high) / 100)
+                    else:
+                        load_increase_value = int(round(self.c_current_load * metric_evolution_based_percentage_increase) / 100)
+        if self.test_type == "emix":
+            if 15 < resource_based_percentage_increase < 40:
+                load_increase_value = int(load_increase_value / self.count_load_adjust_emix)
+            if resource_based_percentage_increase <= 15:
+                load_increase_value = int(load_increase_value / 2.5)
+        if check_minimal_load:                
+            counted_minimal_load_spec_change_1 = int(self.c_current_load * 0.004)
+            counted_minimal_load_spec_change_2 = self.round_up_to_core(self.c_current_load, self.client_core_count) + self.minimal_load_spec_change * self.in_capacity_adjust                                                 - self.c_current_load
+            counted_minimal_load_spec_change = max(counted_minimal_load_spec_change_1, counted_minimal_load_spec_change_2)
+            if load_increase_value < counted_minimal_load_spec_change:
+                load_increase_value = counted_minimal_load_spec_change
+            if len(self.load_increase_list) >=2 and resource_based_percentage_increase < 10 and load_increase_value > self.load_increase_list[-1]:
+                load_increase_value = int((self.load_increase_list[-1] + self.load_increase_list[-2]) / 2)
+        load_increase_value = self.round_up_to_core(load_increase_value, self.client_core_count)
+        counted_load = self.c_current_load + load_increase_value
+        counted_load = self.round_up_to_core(counted_load, self.client_core_count)
+        load_increase_value = counted_load - self.c_current_load
+        self.load_increase_list.append(load_increase_value)
+        log.debug(f"{load_increase_value} will be added to current load {self.c_current_load}")
+        return counted_load
 
     def print_test_status(self):
         status = (
@@ -789,32 +1130,45 @@ class CfRunTest:
 
     def print_test_stats(self):
         stats = (
-            f"{self.time_elapsed}s {self.phase} -load: {self.c_current_load:,}/{self.c_desired_load:,} "
-            f"-current/desired var: {self.c_current_desired_load_variance} "
-            f"-current avg/max var: {self.rolling_tps.avg_max_load_variance} "
-            f"-seek ready: {self.rolling_count_since_goal_seek.stable}"
-            f"\n-tps: {self.c_http_successful_txns_sec:,} -tps stable: {self.rolling_tps.stable} "
-            f"-tps cur avg: {self.rolling_tps.avg_val:,} -tps prev: {self.rolling_tps.avg_val_last:,} "
-            f"-delta tps: {self.rolling_tps.increase_avg} -tps list:{self.rolling_tps.list} "
-            f"\n-cps: {self.c_tcp_established_conn_rate:,} -cps stable: {self.rolling_cps.stable} "
-            f"-cps cur avg: {self.rolling_cps.avg_val:,} -cps prev: {self.rolling_cps.avg_val_last:,} "
-            f"-delta cps: {self.rolling_cps.increase_avg} -cps list:{self.rolling_cps.list} "
-            f"\n-conns: {self.c_tcp_established_conns:,} -conns stable: {self.rolling_conns.stable} "
-            f"-conns cur avg: {self.rolling_conns.avg_val:,} -conns prev: {self.rolling_conns.avg_val_last:,} "
-            f"-delta conns: {self.rolling_cps.increase_avg} -conns list:{self.rolling_conns.list} "
-            f"\n-bw: {self.c_total_bandwidth:,} -bw stable: {self.rolling_bw.stable} "
-            f"-bw cur avg: {self.rolling_bw.avg_val:,} -bw prev: {self.rolling_bw.avg_val_last:,} "
-            f"-delta bw: {self.rolling_bw.increase_avg} -bw list:{self.rolling_bw.list} "
-            f"\n-ttfb: {self.c_tcp_avg_ttfb:,} -ttfb stable: {self.rolling_ttfb.stable} "
-            f"-ttfb cur avg: {self.rolling_ttfb.avg_val:,} -ttfb prev: {self.rolling_ttfb.avg_val_last:,} "
-            f"-delta ttfb: {self.rolling_ttfb.increase_avg} -ttfb list:{self.rolling_ttfb.list} "
-            # f"\n-total bw: {self.c_total_bandwidth:,} -rx bw: {self.c_rx_bandwidth:,}"
-            # f" tx bw: {self.c_tx_bandwidth:,}"
-            # f"\n-ttfb cur avg: {self.rolling_ttfb.avg_val} -ttfb prev: {self.rolling_ttfb.avg_val_last} "
-            # f"-delta ttfb: {self.rolling_ttfb.increase_avg} -ttfb list:{self.rolling_ttfb.list}"
+            f"{self.time_elapsed}s {self.phase} "
+            f"-seek ready: {str(self.rolling_count_since_goal_seek.stable):5}"
+            f"\n-load: {self.c_current_load:3.0f}/{self.c_desired_load:3.0f}  -stable: {str(self.rolling_load.stable):5} "
+            f" -cur avg/max var: {self.rolling_load.avg_max_variance:3.2f} "
+            f" -current/desired load var: {self.c_current_desired_load_variance:6.1f} "
+            f" -delta: {self.rolling_load.increase_avg:4.2f} load list: {self.rolling_load.list}"
+            f"\n-bw:{self.c_total_bandwidth:10,.0f}  -stable: {str(self.rolling_bw.stable):5} "
+            f" -cur avg/max var: {self.rolling_bw.avg_max_variance:3.2f} "
+            f" -cur avg:{self.rolling_bw.avg_val:8.0f}  -prev:{self.rolling_bw.avg_val_last:8.0f} "
+            f" -delta: {self.rolling_bw.increase_avg:4.2f}  -bw list: {self.rolling_bw.list}"
+            f"\n-tps: {self.c_http_successful_txns_sec:8.0f}  -stable: {str(self.rolling_tps.stable):5} "
+            f" -cur avg/max var: {self.rolling_tps.avg_max_variance:3.2f} "
+            f" -cur avg: {self.rolling_tps.avg_val:7.0f}  -prev: {self.rolling_tps.avg_val_last:7.0f} "
+            f" -delta: {self.rolling_tps.increase_avg:4.2f} -tps list: {self.rolling_tps.list}"
+            f"\n-cps: {self.c_tcp_established_conn_rate:8.0f}  -stable: {str(self.rolling_cps.stable):5} "
+            f" -cur avg/max var: {self.rolling_cps.avg_max_variance:3.2f} "
+            f" -cur avg: {self.rolling_cps.avg_val:7.0f}  -prev: {self.rolling_cps.avg_val_last:7.0f} "
+            f" -delta: {self.rolling_cps.increase_avg:4.2f} -cps list: {self.rolling_cps.list} "
+            f"\n-conns:{self.c_tcp_established_conns:7.0f}  -stable: {str(self.rolling_conns.stable):5} "
+            f" -cur avg/max var: {self.rolling_conns.avg_max_variance:3.2f} "
+            f" -cur avg: {self.rolling_conns.avg_val:7.0f}  -prev: {self.rolling_conns.avg_val_last:7.0f} "
+            f" -delta: {self.rolling_conns.increase_avg:4.2f} -con list: {self.rolling_conns.list}"
+            f"\n-ttfb: {self.c_tcp_avg_ttfb:7.0f}  -stable: {str(self.rolling_ttfb.stable):5} "
+            f" -cur avg/max var: {self.rolling_ttfb.avg_max_variance:3.2f} "
+            f" -cur avg: {self.rolling_ttfb.avg_val:7.1f}  -prev: {self.rolling_ttfb.avg_val_last:7.1f} "
+            f" -delta: {self.rolling_ttfb.increase_avg:4.2f} ttfb list: {self.rolling_ttfb.list}"
+            f"\n-cpu_c: {self.c_loadspec_avg_cpu:6.1f}  -pktmemused_c: {self.c_memory_packetmem_used:4.0f} "
+            f" -memused_c: {self.c_memory_main_used:5.0f}  -memusedpert_c: {self.c_memory_percent_used:3.1f}"
+            f"\n-cpu_s: {self.s_memory_avg_cpu:6.1f}  -pktmemUsed_s: {self.s_memory_packetmem_used:4.0f} "
+            f" -memused_s: {self.s_memory_main_used:5.0f}  -memusedperc_s: {self.s_memory_percent_used:3.1f}"
+            f"\n-attempt txn: {self.c_http_attempted_txns:8.0f}  -success txns: {self.c_http_successful_txns:8.0f} "
+            f" -failed txns: {self.c_http_unsuccessful_txns} (unsucc) + {self.c_http_aborted_txns} (abort)"
+            f"\n-highest_tps: {self.highest_pair['highest_tps']:8.0f}  -highest_load: {self.highest_pair['highest_load']:8.0f} "
+            f" -highest_desired_load: {self.highest_pair['highest_desired_load']:5.0f}  -highest_bw: {self.highest_pair['highest_bw']:5,.0f} "
+            f" -highest_cps: {self.highest_pair['highest_cps']:5.0f}  -highest_conns: {self.highest_pair['highest_conns']}"
+            f"\n-max_load_reached: {self.max_load_reached}  -goal_seek_count_after_max_load: {self.goal_seek_count_after_max_load}"
         )
         print(stats)
-        log.debug(stats)
+        log.debug(f"\n{stats}")
 
     def wait_for_running_status(self):
         """
@@ -824,7 +1178,8 @@ class CfRunTest:
         log.debug("Inside the RunTest/wait_for_running_status method.")
         i = 0
         while True:
-            time.sleep(4)
+            log.info(f"Sleeping {self.stat_sampling_interval} seconds")
+            time.sleep(self.stat_sampling_interval)
             self.timer = int(round(time.time() - self.start_time))
             i += 4
             if not self.update_test_run():
@@ -904,7 +1259,8 @@ class CfRunTest:
         log.debug("Inside the RunTest/wait_for_running_sub_status method.")
         i = 0
         while True:
-            time.sleep(4)
+            log.info(f"Sleeping {self.stat_sampling_interval} seconds")
+            time.sleep(self.stat_sampling_interval)
             self.timer = int(round(time.time() - self.start_time))
             i += 4
             if not self.update_test_run():
@@ -942,7 +1298,8 @@ class CfRunTest:
 
         i = 0
         while True:
-            time.sleep(4)
+            log.info(f"Sleeping {self.stat_sampling_interval} seconds")
+            time.sleep(self.stat_sampling_interval)
             self.timer = int(round(time.time() - self.start_time))
             i += 4
             if not self.update_test_run():
@@ -1003,7 +1360,8 @@ class CfRunTest:
                 log.error(error_msg)
                 print(error_msg)
                 return False
-            time.sleep(4)
+            log.info(f"Sleeping {self.stat_sampling_interval} seconds")
+            time.sleep(self.stat_sampling_interval)
             i = i + 4
             print(f"")
         self.time_to_activity = self.timer - self.time_to_start - self.time_to_run
@@ -1018,24 +1376,49 @@ class CfRunTest:
         :param t: countdown in seconds
         :return: None
         """
+        log.info(f"Sleeping {t} seconds")
         while t:
             mins, secs = divmod(t, 60)
             time_format = "{:02d}:{:02d}".format(mins, secs)
-            print(time_format, end="\r")
+            #print(time_format, end="\r")
             time.sleep(1)
             t -= 1
 
     def goal_seek(self):
         log.info(f"In goal_seek function")
+      #  self.bad_load_count = 0
         if self.c_current_load == 0:
             self.stop = True
             log.info(f"goal_seek stop, c_current_load == 0")
             return False
         if self.first_goal_load_increase:
+            log.info(f"First time goal_seek")
             self.first_goal_load_increase = False
-            new_load = self.c_current_load + (self.in_incr_low *
-                                              self.in_capacity_adjust)
+            new_load = self.c_current_load + (self.in_incr_low * self.in_capacity_adjust)
+            log.info(f"new load {new_load} = current_load {self.c_current_load} + {self.in_incr_low} * {self.in_capacity_adjust}")
+            if new_load <= self.c_desired_load:
+                log.info(f"{new_load} (new load) <= {self.c_desired_load} (current desired load)")
+                self.max_load_reached = True
+                return False
+            if self.test_suite == "default":
+                if new_load < 32:
+                    new_load = self.round_up_to_core(32, self.client_core_count) 
+            self.load_increase_list.append(self.in_incr_low * self.in_capacity_adjust)
         else:
+          if self.test_suite == "default":
+            if self.test_type == "conns":
+                 new_load = self.goal_seek_set_conns_by_resource()
+                 log.info(f"new_load = {new_load}")
+            elif self.check_if_load_type_simusers():
+                new_load = self.goal_seek_set_simuser_kpi_by_resource(self.kpi_1)
+                log.info(f"new_load = {new_load}")
+            elif self.check_if_load_type_default():
+                new_load = self.goal_seek_set_default_by_resource()
+                log.info(f"new_load = {new_load}")
+            else:
+                report_error = f"Unknown load type: " \
+                    f"{self.test_config['config']['loadSpecification']['type']}"
+          else:
             if self.check_if_load_type_simusers():
                 new_load = self.goal_seek_set_simuser_kpi(self.kpi_1)
                 log.info(f"new_load = {new_load}")
@@ -1056,8 +1439,14 @@ class CfRunTest:
             log.info(f"Goal_seek return, new_load is False")
             return False
 
-        self.change_update_load(new_load, 16)
-
+        self.new_load_list.append(new_load)
+        count_time = self.stat_sampling_interval * 4
+        self.change_update_load(new_load, count_time)
+        if self.max_load_reached == True:
+            self.goal_seek_count_after_max_load += 1
+        self.goal_seek_count += 1
+        log.info(f"Goal seeking has changed load list:   {self.new_load_list}")
+        log.info(f"Goal seeking has increased load list: {self.load_increase_list}")
         return True
 
     def ramp_seek(self, ramp_kpi, ramp_to_value):
@@ -1098,6 +1487,12 @@ class CfRunTest:
     def round_up_to_even(v):
         return math.ceil(v / 2.) * 2
 
+    @staticmethod
+    def round_up_to_core(v, core_count):
+        v = math.ceil(v / core_count) * core_count
+        log.debug(f"Round up the load to {v} according to core count {core_count}")
+        return v
+
     def check_if_load_type_simusers(self):
         if self.test_config["config"]["loadSpecification"]["type"].lower() in {
             "simusers",
@@ -1116,7 +1511,8 @@ class CfRunTest:
         return False
 
     def change_update_load(self, new_load, count_down):
-        new_load = self.round_up_to_even(new_load)
+        if self.test_suite != "default":
+            new_load = self.round_up_to_even(new_load)
         log_msg = f"\nchanging load from: {self.c_current_load} to: {new_load}  status: {self.status}"
         log.info(log_msg)
         print(log_msg)
@@ -1124,7 +1520,7 @@ class CfRunTest:
             self.cf.change_load(self.id, new_load)
             self.rolling_tps.load_increase_complete()
             self.rolling_ttfb.load_increase_complete()
-            self.rolling_current_load.load_increase_complete()
+            self.rolling_load.load_increase_complete()
             self.rolling_cps.load_increase_complete()
             self.rolling_conns.load_increase_complete()
             self.rolling_bw.load_increase_complete()
@@ -1179,13 +1575,54 @@ class CfRunTest:
                 f"{self.in_threshold_high} in_threshold_high"
             )
             return False
-        if kpi.avg_max_load_variance < 0.97:
+        if kpi.avg_max_variance < 0.97:
             set_load = self.c_current_load
             self.max_load_reached = True
         log.info(
             f"set_load = {set_load}  "
-            f"kpi_avg_max_load_variance: {kpi.avg_max_load_variance}"
+            f"kpi_avg_max_variance: {kpi.avg_max_variance}"
         )
+        return set_load
+
+    def goal_seek_set_default_by_resource(self):
+        log.info(f"In goal_seek_set_default_by_resource function")
+        log.info(f"load.increase_avg: {self.rolling_load.increase_avg}, load.no_positive_increase_count: {self.rolling_load.no_positive_increase_count}")
+        if self.rolling_load.increase_avg < 0 and self.rolling_load.no_positive_increase_count >= 3:
+            self.max_load_reached = True
+        if self.max_load_reached == True:
+            message = f"max load {self.highest_pair['highest_load']} reached"
+            log.info(message)
+            print(message)
+        set_load = self.count_new_load()
+        return set_load
+
+    def goal_seek_set_conns_by_resource(self):
+        log.info(f"In goal_seek_set_conns_by_resource function")
+        log.info(f"current_desired_load_variance: {self.c_current_desired_load_variance}, client memory_percent_used: {self.c_memory_percent_used}, server memory_percent_used: {self.s_memory_percent_used}")
+        #if self.c_current_desired_load_variance >= 1.0 and self.c_memory_percent_used < 100 and self.s_memory_percent_used < 100 and self.rolling_tps.avg_val !=0:
+        if self.c_current_desired_load_variance >= 1.0 and self.c_memory_percent_used < 100 and self.s_memory_percent_used < 100:
+            set_load = self.count_new_load()
+        else:
+            self.max_load_reached = True
+            set_load = self.count_new_load()
+        if self.max_load_reached == True:
+            message = f"max load {self.highest_pair['highest_load']} reached"
+            log.info(message)
+            print(message)
+        return set_load
+    
+    def goal_seek_set_simuser_kpi_by_resource(self, kpi):
+        log.info(f"In goal_seek_set_simuser_kpi_by_resource function")
+        log.info(f"Kpi avg_max_variance: {kpi.avg_max_variance}, Kpi.increase_avg: {kpi.increase_avg}, Kpi.no_positive_increase_count: {kpi.no_positive_increase_count}, rolling_load.increase_avg: {self.rolling_load.increase_avg}, rolling_load.not_high_count: {self.rolling_load.not_high_count}")
+        if kpi.avg_max_variance >= 0.97 and self.rolling_load.increase_avg > 0 and kpi.increase_avg<= 0:
+            self.max_load_reached = True
+        elif kpi.avg_max_variance < 0.97 and kpi.no_positive_increase_count >= 3:
+            self.max_load_reached = True
+        if self.max_load_reached == True:
+            message = f"max load {self.highest_pair['highest_load']} reached"
+            log.info(message)
+            print(message)
+        set_load = self.count_new_load()
         return set_load
 
     def update_rolling_averages(self):
@@ -1199,8 +1636,8 @@ class CfRunTest:
         self.rolling_ttfb.update(self.c_tcp_avg_ttfb)
         self.rolling_ttfb.check_if_stable(self.max_var_reference)
 
-        self.rolling_current_load.update(self.c_current_load)
-        self.rolling_current_load.check_if_stable(self.max_var_reference)
+        self.rolling_load.update(self.c_current_load)
+        self.rolling_load.check_if_stable(self.max_var_reference)
 
         self.rolling_cps.update(self.c_tcp_established_conn_rate)
         self.rolling_cps.check_if_stable(self.max_var_reference)
@@ -1300,13 +1737,13 @@ class CfRunTest:
             self.update_run_stats()
             self.update_phase()
             self.check_stop_conditions()
+            self.update_sample_size(3)
             self.update_rolling_averages()
-
+            self.check_highest_pair()
             # print stats if test is running
             if self.sub_status is None:
                 self.print_test_stats()
                 self.save_results()
-
             if self.in_ramp_seek and not self.ramp_seek_complete:
                 log.info(f"control_test going to ramp_seek")
                 self.control_test_ramp_seek(self.ramp_seek_kpi, self.in_ramp_seek_value)
@@ -1316,7 +1753,8 @@ class CfRunTest:
                 self.control_test_goal_seek_kpi(self.kpi_1, self.kpi_2,
                                                 self.in_kpi_and_or)
             print(f"")
-            time.sleep(4)
+            log.info(f"Sleeping {self.stat_sampling_interval} seconds")
+            time.sleep(self.stat_sampling_interval)
         # if goal_seek is yes enter sustained steady phase
         if self.in_goal_seek and self.in_sustain_period > 0:
             self.sustain_test()
@@ -1346,6 +1784,41 @@ class CfRunTest:
         if self.phase == "finished":
             log.info(f"control_test end, over duration time > phase: finished")
             self.stop = True
+
+    def update_sample_size(self, new_sample_size):
+        if (self.c_loadspec_avg_cpu > 70 or self.s_memory_avg_cpu > 70) and self.rolling_tps.sample_size != new_sample_size:
+           self.rolling_tps.sample_size = new_sample_size
+           self.rolling_cps.sample_size = new_sample_size
+           self.rolling_load.sample_size = new_sample_size
+           self.rolling_conns.sample_size = new_sample_size
+           self.rolling_bw.sample_size = new_sample_size
+           self.rolling_ttfb.sample_size = new_sample_size
+           self.rolling_count_since_goal_seek.sample_size = new_sample_size
+
+    def check_highest_pair(self):
+        if self.test_type == "conns":
+            if self.c_tcp_established_conns > self.highest_pair["highest_conns"]:
+                self.max_load_reached = False
+                self.goal_seek_count_after_max_load = 0
+                self.highest_pair = {"highest_conns": self.c_tcp_established_conns, "highest_load": self.c_current_load, "highest_desired_load": self.c_desired_load, 
+                                     "highest_bw": self.rolling_bw.avg_val, "highest_cps": self.kpi_2.avg_val, "highest_tps": self.kpi_1.avg_val}
+        else:
+            if self.highest_pair["highest_tps"] != 0:
+                if 100 * (self.kpi_1.avg_val - self.highest_pair["highest_tps"]) / self.highest_pair["highest_tps"] >= 0.03: 
+                    self.max_load_reached = False
+                    self.goal_seek_count_after_max_load = 0
+            if self.device_description == "CFV":
+              if self.kpi_1.avg_val >= self.highest_pair["highest_tps"] and self.kpi_1.stable:
+                  pass
+              else:
+                  return
+            else:
+              if self.kpi_1.avg_val > self.highest_pair["highest_tps"] and self.kpi_1.stable:
+                  pass
+              else:
+                  return
+            self.highest_pair = {"highest_tps": self.kpi_1.avg_val, "highest_load": self.c_current_load, "highest_desired_load": self.c_desired_load, 
+                                 "highest_bw": self.rolling_bw.avg_val, "highest_cps": self.kpi_2.avg_val, "highest_conns": self.c_tcp_established_conns}
 
     def control_test_ramp_seek(self, ramp_kpi, ramp_to_value):
         """
@@ -1412,30 +1885,66 @@ class CfRunTest:
     def control_test_goal_seek_kpi(self, kpi_1,
                                    kpi_2, kpis_and_bool):
         log.info(
-            f"rolling_count_list stable: {self.rolling_count_since_goal_seek.stable} "
-            f"list: {self.rolling_count_since_goal_seek.list} "
-            f"\nKpi1 stable: {kpi_1.stable} list: {kpi_1.list}"
-            f"\nKpi2 stable: {kpi_2.stable} list: {kpi_2.list}"
+            f"\nrolling_count_list stable: {str(self.rolling_count_since_goal_seek.stable):5} "
+            f" -list: {self.rolling_count_since_goal_seek.list} "
+            f"\nKpi1 {self.in_kpi_1} stable: {str(kpi_1.stable):15}  -list: {kpi_1.list}  unstable_count: {kpi_1.unstable_count}"
+            f"\nKpi2 {self.in_kpi_2} stable: {str(kpi_2.stable):15}  -list: {kpi_2.list}     unstable_count: {kpi_2.unstable_count}"
+            f"\nKpi1.no_positive_increase_count: {kpi_1.no_positive_increase_count}"
+            f"\nload.no_positive_increase_count: {self.rolling_load.no_positive_increase_count}"
+            f"\nmax_load_reached is: {self.max_load_reached}, goal_seek_count_after_max_load is : {self.goal_seek_count_after_max_load}"
         )
         if self.phase is not "goalseek":
             log.info(f"phase {self.phase} is not 'goalseek', "
                      f"returning from contol_test_goal_seek")
             return
-        if not self.rolling_count_since_goal_seek.stable:
+        if self.c_http_unsuccessful_txns > 0 or self.c_http_aborted_txns > 0:
+            log.info(f"Failed transactions: {self.c_http_unsuccessful_txns} (unsucc) and {self.c_http_aborted_txns} (aborted)\n")
+            self.stop = True
+            return 
+        if self.test_type == "conns":
+            if self.in_load_type == "SimUsers/Second":
+                if kpi_1.stable and self.max_load_reached:
+                    self.stop = True
+                    return
+                elif kpi_1.stable:
+                    pass
+                else:
+                    return
+            else:
+                log.info(f"Current tps: {self.c_http_successful_txns_sec} -cps: {self.c_tcp_established_conn_rate}")
+                if self.c_http_successful_txns_sec == 0 or self.c_tcp_established_conn_rate == 0:
+                    log.info(f"Ready for Open Conns goal seeking")
+                    pass
+                else:
+                    log.info(f"Not ready for Open Conns goal seeking, continue to add current load")
+                    return 
+        elif not self.rolling_count_since_goal_seek.stable:
             log.info(f"count since goal seek is not stable. "
                      f"count list: {self.rolling_count_since_goal_seek.list}")
             return
-        if self.max_load_reached:
-            log.info(f"control_test end, max_load_reached")
+        else:
+            if self.goal_seek_count >= 3 and kpi_1.unstable_count >= 20 and self.c_current_desired_load_variance < 0.97:
+                new_load = int(self.new_load_list[-1] - abs(self.load_increase_list[-1])/2)
+                self.change_update_load(new_load, self.stat_sampling_interval * 4) 
+                self.new_load_list.append(new_load)
+                self.load_increase_list.append(self.new_load_list[-1] - self.new_load_list[-2])
+                return
+        if self.max_load_reached and self.goal_seek_count_after_max_load >= 2:
+            log.info(f"control_test end, max_load_reached and goal_seek_count_after_max_load is {self.goal_seek_count_after_max_load}")
             self.stop = True
             return
 
-        if kpis_and_bool:
+        if self.test_type == "conns":
+            goal_seek = True
+        elif self.goal_seek_count <= 2 and kpi_1.unstable_count >= 5:
+            goal_seek = True
+        else:
+          if kpis_and_bool:
             if kpi_1.stable and kpi_2.stable:
                 goal_seek = True
             else:
                 goal_seek = False
-        else:
+          else:
             if kpi_1.stable or kpi_2.stable:
                 goal_seek = True
             else:
@@ -1447,16 +1956,24 @@ class CfRunTest:
                 # at least the window size interval.
                 # allows stats to stabilize after an increase
                 self.rolling_count_since_goal_seek.reset()
+                self.rolling_load.reset_count()
+                kpi_1.reset_count()
+                kpi_2.reset_count()
             else:
                 log.info(f"control_test end, goal_seek False")
                 self.stop = True
 
     def sustain_test(self):
         self.phase = "steady"
+        if self.highest_pair["highest_desired_load"] != 0:
+            self.cf.change_load(self.id, self.highest_pair["highest_desired_load"])
+            log.info(f"Sleeping {self.stat_sampling_interval*4} seconds")
+            time.sleep(self.stat_sampling_interval*4)
         while self.in_sustain_period > 0:
             self.timer = int(round(time.time() - self.start_time))
             sustain_period_loop_time_start = time.time()
             self.update_run_stats()
+            self.update_rolling_averages()
             if self.time_remaining < 30 and self.in_goal_seek:
                 self.phase = "timeout"
                 self.in_sustain_period = 0
@@ -1469,7 +1986,8 @@ class CfRunTest:
                 self.print_test_stats()
                 self.save_results()
 
-            time.sleep(4)
+            log.info(f"Sleeping {self.stat_sampling_interval} seconds")
+            time.sleep(self.stat_sampling_interval)
             self.in_sustain_period = self.in_sustain_period - (
                 time.time() - sustain_period_loop_time_start
             )
@@ -1547,7 +2065,10 @@ class DetailedCsvReport:
     def __init__(self, report_location):
         log.debug("Initializing detailed csv result files.")
         self.time_stamp = time.strftime("%Y%m%d-%H%M")
-        self.report_csv_file = report_location / f"{self.time_stamp}_Detailed.csv"
+        log.debug(f"Current time stamp: {self.time_stamp}")
+        self.report_location_parent = report_location
+        #self.report_csv_file = report_location / f"{self.time_stamp}_Detailed.csv"
+        #self.report_csv_file_orig = self.report_csv_file
         self.columns = [
             "test_name",
             "seconds",
@@ -1642,6 +2163,21 @@ class DetailedCsvReport:
                 f"Exception occurred  writing to the detailed report file: \n<{detailed_exception}>\n"
             )
 
+    def make_report_csv_file(self, new_report_csv_name):
+        new_report_csv_name = self.report_location / f"{new_report_csv_name}_{self.time_stamp}_Detailed.csv"
+        if new_report_csv_name.is_file():
+            return
+        else:
+            self.report_csv_file = new_report_csv_name
+            self.append_columns()
+
+    def make_report_dir(self, report_dir_name):
+        report_dir = self.report_location_parent / report_dir_name
+        if report_dir.is_dir():
+            pass
+        else:
+            report_dir.mkdir(parents=False, exist_ok=True)
+        self.report_location = report_dir
 
 class Report:
     def __init__(self, report_csv_file, column_order):
